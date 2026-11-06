@@ -1,0 +1,4 @@
+streamlit>=1.35,<2
+numpy>=1.26,<3
+scenedetect>=0.6.4,<1
+faster-whisper>=1.1,<2
