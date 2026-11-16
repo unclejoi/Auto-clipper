@@ -1,4 +1,4 @@
-streamlit>=1.35,<2
-numpy>=1.26,<3
-scenedetect>=0.6.4,<1
-faster-whisper>=1.1,<2
+streamlit>=1.36.0
+numpy>=1.26.0
+scenedetect[opencv]>=0.6.4
+faster-whisper>=1.0.0

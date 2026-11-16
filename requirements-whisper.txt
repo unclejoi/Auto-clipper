@@ -1,0 +1,4 @@
+# Optional speech-analysis dependency
+# Install this only when using Python 3.12 in a compatible environment.
+faster-whisper>=1.0.0,<2
+av==18.1.0

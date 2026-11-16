@@ -1,141 +1,645 @@
-import json
+import math
 import shutil
 import subprocess
 import tempfile
+import wave
 import zipfile
 from pathlib import Path
 
 import numpy as np
 import streamlit as st
-from scenedetect import ContentDetector, detect
-
-st.set_page_config(page_title="Universal Auto Clipper", page_icon="🎬", layout="wide")
-st.title("🎬 Universal Auto Clipper")
-st.caption("Upload a video and automatically make short clips using scene changes, audio energy and optional speech transcription.")
+from scenedetect import open_video, SceneManager
+from scenedetect.detectors import ContentDetector
 
 
-def run(*args):
-    return subprocess.run(args, check=True, capture_output=True, text=True)
+st.set_page_config(
+    page_title="Universal AI Auto Clipper",
+    page_icon="✂️",
+    layout="wide"
+)
+st.title("✂️ Universal AI Auto Clipper")
+st.caption(
+    "Automatically ranks promising moments and exports "
+    "30-second highlights."
+)
+
+
+def cmd(args):
+    process = subprocess.run(args, capture_output=True, text=True)
+    if process.returncode:
+        raise RuntimeError(
+            process.stderr[-2500:] or "Command failed"
+        )
+    return process.stdout
+
+
+def check_ffmpeg():
+    missing = [
+        executable
+        for executable in ("ffmpeg", "ffprobe")
+        if not shutil.which(executable)
+    ]
+    if missing:
+        raise RuntimeError(
+            f"Missing {', '.join(missing)}. "
+            "Install FFmpeg and add its bin folder to PATH."
+        )
 
 
 def duration_of(path):
-    data = json.loads(run("ffprobe", "-v", "error", "-show_format", "-of", "json", str(path)).stdout)
-    return float(data["format"]["duration"])
+    output = cmd([
+        "ffprobe",
+        "-v", "error",
+        "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        str(path)
+    ])
+    return float(output.strip())
 
 
-def audio_energy(path, duration, interval=2.0):
-    # Decode mono PCM at 8 kHz. Read in chunks to avoid keeping long recordings in RAM.
-    proc = subprocess.Popen(["ffmpeg", "-v", "error", "-i", str(path), "-vn", "-ac", "1", "-ar", "8000", "-f", "s16le", "pipe:1"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-    values = []
-    block = int(8000 * interval) * 2
-    while True:
-        raw = proc.stdout.read(block)
-        if not raw:
-            break
-        samples = np.frombuffer(raw, dtype=np.int16).astype(np.float32)
-        values.append(float(np.sqrt(np.mean((samples / 32768) ** 2))) if len(samples) else 0)
-    proc.wait()
-    if not values:
-        return np.zeros(max(1, int(np.ceil(duration / interval))), dtype=np.float32)
-    return np.asarray(values, dtype=np.float32)
+def get_audio(path, wavpath):
+    cmd([
+        "ffmpeg", "-y",
+        "-i", str(path),
+        "-vn",
+        "-ac", "1",
+        "-ar", "16000",
+        "-c:a", "pcm_s16le",
+        str(wavpath)
+    ])
 
 
-def transcript_segments(path, enabled):
-    if not enabled:
-        return []
-    from faster_whisper import WhisperModel
-    model = WhisperModel("tiny", device="cpu", compute_type="int8")
-    segments, _ = model.transcribe(str(path), vad_filter=True, beam_size=1)
-    return [{"start": float(s.start), "end": float(s.end), "text": s.text.strip()} for s in segments]
+def audio_scores(wavpath, dur):
+    with wave.open(str(wavpath), "rb") as audio_file:
+        rate = audio_file.getframerate()
+        width = audio_file.getsampwidth()
+        channels = audio_file.getnchannels()
+        raw = audio_file.readframes(audio_file.getnframes())
+
+    if width != 2:
+        raise RuntimeError("Expected 16-bit extracted audio.")
+
+    samples = (
+        np.frombuffer(raw, dtype=np.int16).astype(np.float32)
+        / 32768.0
+    )
+
+    if channels > 1:
+        samples = samples.reshape(-1, channels).mean(axis=1)
+
+    step = rate
+    values = np.array([
+        np.sqrt(np.mean(samples[i:i + step] ** 2) + 1e-12)
+        for i in range(0, len(samples), step)
+    ], dtype=np.float32)
+
+    if not len(values):
+        return np.zeros(max(1, math.ceil(dur)), dtype=np.float32)
+
+    low, high = np.percentile(values, [10, 95])
+    return np.clip(
+        (values - low) / (high - low + 1e-8),
+        0,
+        1
+    )
 
 
-def scene_times(path, duration):
+def scene_scores(path, dur, threshold):
+    video = open_video(str(path))
+    manager = SceneManager()
+    manager.add_detector(ContentDetector(threshold=threshold))
+    manager.detect_scenes(video=video, show_progress=False)
+    scenes = manager.get_scene_list()
+
+    scores = np.zeros(max(1, math.ceil(dur)), dtype=np.float32)
+
+    for scene in scenes[1:]:
+        timestamp = float(scene[0].seconds)
+        index = min(
+            len(scores) - 1,
+            max(0, int(timestamp))
+        )
+        for offset, value in [
+            (-2, 0.3),
+            (-1, 0.6),
+            (0, 1.0),
+            (1, 0.6),
+            (2, 0.3)
+        ]:
+            target = index + offset
+            if 0 <= target < len(scores):
+                scores[target] = max(scores[target], value)
+
+    return scores, len(scenes) - 1
+
+
+KEYWORDS = {
+    "no way": 1.4,
+    "oh my god": 1.5,
+    "let's go": 1.2,
+    "unbelievable": 1.4,
+    "insane": 1.2,
+    "amazing": 1.0,
+    "hilarious": 1.2,
+    "funny": 0.8,
+    "crazy": 0.8,
+    "shocking": 1.2,
+    "surprise": 0.8,
+    "victory": 1.0,
+    "finally": 0.7,
+    "wait": 0.4,
+    "what": 0.3,
+    "wow": 1.0,
+    "secret": 0.8,
+    "best": 0.5,
+    "worst": 0.5
+}
+
+
+def whisper_scores(wavpath, dur, model_size):
     try:
-        scenes = detect(str(path), ContentDetector(threshold=30.0), show_progress=False)
-        cuts = [float(scene[0].get_seconds()) for scene in scenes]
-        return sorted(set([0.0] + cuts + [duration]))
-    except Exception:
-        return [0.0, duration]
+        from faster_whisper import WhisperModel
+    except ImportError:
+        return (
+            np.zeros(max(1, math.ceil(dur)), dtype=np.float32),
+            [],
+            "Whisper unavailable. Install faster-whisper to enable speech analysis."
+        )
+
+    model = WhisperModel(
+        model_size,
+        device="cpu",
+        compute_type="int8"
+    )
+    segments, _ = model.transcribe(
+        str(wavpath),
+        vad_filter=True
+    )
+
+    output = []
+    scores = np.zeros(max(1, math.ceil(dur)), dtype=np.float32)
+
+    for segment in segments:
+        text = (segment.text or "").strip()
+        if not text:
+            continue
+
+        lowered = text.lower()
+        hits = sum(
+            weight
+            for keyword, weight in KEYWORDS.items()
+            if keyword in lowered
+        )
+        value = min(
+            1.0,
+            0.15 + hits * 0.35
+            + min(len(lowered.split()), 20) * 0.012
+        )
+
+        start_index = max(0, int(segment.start))
+        end_index = min(
+            len(scores) - 1,
+            int(max(segment.start, segment.end))
+        )
+
+        for index in range(start_index, end_index + 1):
+            scores[index] = max(scores[index], value)
+
+        output.append({
+            "start": float(segment.start),
+            "end": float(segment.end),
+            "text": text,
+            "score": value
+        })
+
+    return scores, output, None
 
 
-def pick_clips(duration, energies, cuts, transcript, clip_length, count):
-    # Evaluate candidates every five seconds, plus scene boundaries.
-    last_start = max(0, duration - clip_length)
-    starts = set(float(x) for x in np.arange(0, last_start + 0.01, 5.0))
-    starts.update(min(last_start, max(0, c)) for c in cuts)
-    starts.add(last_start)
-    maximum = max(float(np.percentile(energies, 95)), 0.00001)
+def smooth(values):
+    if len(values) <= 1:
+        return values
+    return np.convolve(
+        values,
+        np.ones(5, dtype=np.float32) / 5,
+        mode="same"
+    )
+
+
+def select_clips(
+    dur,
+    audio,
+    visual,
+    speech,
+    has_speech,
+    length=30,
+    min_gap=30,
+    min_score=25
+):
+    """
+    Select every qualifying non-overlapping highlight.
+
+    Clips are exactly 30 seconds. A source shorter than 30 seconds
+    does not produce a clip.
+    """
+    if length != 30:
+        raise ValueError("Clip duration must be exactly 30 seconds.")
+
+    if dur < length:
+        return []
+
+    count = math.ceil(dur)
+
+    def normalize_signal(signal):
+        signal = np.asarray(signal, dtype=np.float32)
+
+        if len(signal) == count:
+            return signal
+
+        if len(signal) == 0:
+            return np.zeros(count, dtype=np.float32)
+
+        return np.interp(
+            np.linspace(0, len(signal) - 1, count),
+            np.arange(len(signal)),
+            signal
+        ).astype(np.float32)
+
+    audio_signal = normalize_signal(audio)
+    visual_signal = normalize_signal(visual)
+    speech_signal = normalize_signal(speech)
+
+    if has_speech:
+        combined = (
+            0.30 * audio_signal
+            + 0.20 * visual_signal
+            + 0.50 * speech_signal
+        )
+    elif np.max(audio_signal) < 0.05:
+        combined = visual_signal
+    else:
+        combined = (
+            0.60 * audio_signal
+            + 0.40 * visual_signal
+        )
+
+    combined = smooth(combined)
     candidates = []
-    for start in sorted(starts):
-        end = min(duration, start + clip_length)
-        i, j = int(start // 2), min(len(energies), int(np.ceil(end / 2)))
-        region = energies[i:max(i + 1, j)]
-        audio_score = min(1.0, float(np.mean(region)) / maximum) if len(region) else 0
-        peak_score = min(1.0, float(np.max(region)) / maximum) if len(region) else 0
-        scene_score = min(1.0, sum(start < c < end for c in cuts) / 4)
-        speech = [s for s in transcript if s["end"] > start and s["start"] < end]
-        speech_score = min(1.0, sum(len(s["text"].split()) for s in speech) / max(1, clip_length * 2))
-        score = 0.4 * audio_score + 0.2 * peak_score + 0.2 * scene_score + 0.2 * speech_score
-        candidates.append((score, start, end))
-    chosen = []
-    for score, start, end in sorted(candidates, reverse=True):
-        if all(max(0, min(end, b) - max(start, a)) < clip_length * 0.25 for _, a, b in chosen):
-            chosen.append((score, start, end))
-        if len(chosen) >= count:
-            break
-    return sorted(chosen, key=lambda x: x[1])
+
+    # Score each whole-second start position.
+    last_start = int(dur - length)
+
+    for start in range(last_start + 1):
+        end = start + length
+        segment = combined[start:end]
+
+        if len(segment) != length:
+            continue
+
+        peak = float(np.max(segment))
+        average = float(np.mean(segment))
+        variation = float(np.std(segment))
+
+        score = 100 * (
+            0.60 * peak
+            + 0.30 * average
+            + 0.10 * min(variation * 2, 1.0)
+        )
+
+        if score >= min_score:
+            candidates.append({
+                "start": float(start),
+                "end": float(end),
+                "score": score
+            })
+
+    candidates.sort(
+        key=lambda candidate: candidate["score"],
+        reverse=True
+    )
+
+    selected = []
+    effective_gap = max(length, min_gap)
+
+    for candidate in candidates:
+        if all(
+            abs(candidate["start"] - previous["start"])
+            >= effective_gap
+            for previous in selected
+        ):
+            selected.append(candidate)
+
+    return sorted(
+        selected,
+        key=lambda candidate: candidate["start"]
+    )
 
 
-def render_clip(source, dest, start, end, vertical):
-    vf = (["-vf", "scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2"] if vertical else [])
-    run("ffmpeg", "-y", "-v", "error", "-ss", str(start), "-i", str(source), "-t", str(end - start), *vf, "-c:v", "libx264", "-preset", "veryfast", "-crf", "24", "-c:a", "aac", "-movflags", "+faststart", str(dest))
+def cut(source, output, start, length=30, vertical=True):
+    if length != 30:
+        raise ValueError("Clip duration must be exactly 30 seconds.")
+
+    video_filter = (
+        "scale=1080:1920:force_original_aspect_ratio=increase,"
+        "crop=1080:1920"
+        if vertical else
+        "scale=1920:1080:force_original_aspect_ratio=decrease,"
+        "pad=1920:1080:(ow-iw)/2:(oh-ih)/2"
+    )
+
+    # Input-side seeking is efficient; -t limits the output to 30 seconds.
+    cmd([
+        "ffmpeg", "-y",
+        "-ss", f"{start:.3f}",
+        "-i", str(source),
+        "-t", "30",
+        "-map", "0:v:0",
+        "-map", "0:a?",
+        "-vf", video_filter,
+        "-c:v", "libx264",
+        "-preset", "veryfast",
+        "-crf", "23",
+        "-c:a", "aac",
+        "-b:a", "128k",
+        "-t", "30",
+        "-movflags", "+faststart",
+        str(output)
+    ])
+
+    actual_duration = duration_of(output)
+
+    if abs(actual_duration - 30.0) > 0.15:
+        raise RuntimeError(
+            "Exported clip duration was "
+            f"{actual_duration:.3f} seconds, not 30 seconds."
+        )
 
 
-if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
-    st.error("FFmpeg and ffprobe are required. Install FFmpeg and restart the app.")
-    st.stop()
+with st.sidebar:
+    st.header("Clip settings")
 
-file = st.file_uploader("Upload your video", type=["mp4", "mov", "mkv", "webm"])
-left, right = st.columns(2)
-with left:
-    clip_length = st.slider("Clip length (seconds)", 10, 90, 30, 5)
-    count = st.slider("Number of clips", 1, 10, 3)
-with right:
-    vertical = st.checkbox("Export 9:16 vertical clips (with padding)", value=True)
-    transcribe = st.checkbox("Use AI speech transcription (slower; downloads model first time)", value=False)
+    length = 30
+    st.info("All exported clips are targeted at exactly 30 seconds.")
 
-if file and st.button("✂️ Find highlights and create clips", type="primary"):
-    with tempfile.TemporaryDirectory() as tmp:
-        folder = Path(tmp)
-        suffix = Path(file.name).suffix.lower()
-        source = folder / ("source" + suffix)
-        with source.open("wb") as out:
-            while chunk := file.read(1024 * 1024):
-                out.write(chunk)
-        try:
-            with st.spinner("Analyzing scenes and sound..."):
-                duration = duration_of(source)
-                if duration <= 0:
-                    raise ValueError("Video has no valid duration")
-                energies = audio_energy(source, duration)
-                cuts = scene_times(source, duration)
-                speech = transcript_segments(source, transcribe)
-                selected = pick_clips(duration, energies, cuts, speech, min(clip_length, duration), count)
-            output_zip = folder / "clips.zip"
-            with zipfile.ZipFile(output_zip, "w", compression=zipfile.ZIP_STORED) as archive:
-                for index, (score, start, end) in enumerate(selected, 1):
-                    clip = folder / f"clip_{index:02d}.mp4"
-                    with st.spinner(f"Rendering clip {index}/{len(selected)}..."):
-                        render_clip(source, clip, start, end, vertical)
-                    archive.write(clip, clip.name)
-                    st.subheader(f"Clip {index} — {start:.1f}s to {end:.1f}s")
-                    st.video(clip.read_bytes())
-                    st.download_button(f"Download clip {index}", clip.read_bytes(), file_name=clip.name, mime="video/mp4")
-            st.download_button("⬇️ Download all clips (ZIP)", output_zip.read_bytes(), file_name="auto_clips.zip", mime="application/zip", type="primary")
-            st.success("Done! Download the clips before refreshing the page.")
-        except Exception as exc:
-            st.error(f"Processing failed: {exc}")
-            st.info("Try a short MP4 with H.264 video and AAC audio first.")
+    vertical = st.checkbox(
+        "Vertical 9:16 export",
+        value=True
+    )
+
+    use_whisper = st.checkbox(
+        "Enable Whisper speech analysis",
+        value=False
+    )
+
+    model_size = st.selectbox(
+        "Whisper model",
+        ["tiny", "base", "small"],
+        disabled=not use_whisper
+    )
+
+    threshold = st.slider(
+        "Scene-change sensitivity",
+        10, 50, 27
+    )
+
+    gap = st.slider(
+        "Minimum gap between clips (seconds)",
+        30, 180, 30
+    )
+
+    min_score = st.slider(
+        "Minimum highlight score",
+        0, 100, 25
+    )
+
+    st.caption(
+        "All qualifying non-overlapping highlights are selected."
+    )
+
+
+upload = st.file_uploader(
+    "Upload a video",
+    type=["mp4", "mov", "mkv", "webm", "avi"]
+)
+
+st.info(
+    "Test with a short 1–5 minute video first. "
+    "Whisper is optional and can be slow on free hosting."
+)
+
+if upload and st.button(
+    "Detect ALL highlights and create 30-second clips",
+    type="primary",
+    use_container_width=True
+):
+    try:
+        check_ffmpeg()
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            temp = Path(temporary_directory)
+            suffix = Path(upload.name).suffix or ".mp4"
+            source = temp / f"input{suffix}"
+            wav_path = temp / "audio.wav"
+
+            source.write_bytes(upload.getbuffer())
+
+            progress = st.progress(
+                5,
+                text="Reading video..."
+            )
+
+            duration = duration_of(source)
+
+            if duration < 30:
+                st.error(
+                    "The uploaded video must be at least 30 seconds long."
+                )
+                st.stop()
+
+            try:
+                progress.progress(
+                    15,
+                    text="Analyzing audio..."
+                )
+                get_audio(source, wav_path)
+                audio = audio_scores(wav_path, duration)
+                has_audio = True
+            except Exception as audio_error:
+                st.warning(
+                    f"Audio analysis unavailable: {audio_error}"
+                )
+                audio = np.zeros(
+                    math.ceil(duration),
+                    dtype=np.float32
+                )
+                has_audio = False
+
+            progress.progress(
+                35,
+                text="Detecting visual scene changes..."
+            )
+
+            try:
+                visual, scene_count = scene_scores(
+                    source,
+                    duration,
+                    threshold
+                )
+            except Exception as scene_error:
+                st.warning(
+                    f"Scene detection issue: {scene_error}"
+                )
+                visual = np.zeros(
+                    math.ceil(duration),
+                    dtype=np.float32
+                )
+                scene_count = 0
+
+            speech = np.zeros(
+                math.ceil(duration),
+                dtype=np.float32
+            )
+            transcript = []
+
+            if use_whisper and has_audio:
+                progress.progress(
+                    45,
+                    text="Transcribing speech with Whisper..."
+                )
+                speech, transcript, warning = whisper_scores(
+                    wav_path,
+                    duration,
+                    model_size
+                )
+                if warning:
+                    st.warning(warning)
+            elif use_whisper:
+                st.warning(
+                    "No usable audio track; Whisper skipped."
+                )
+
+            progress.progress(
+                65,
+                text="Ranking highlights..."
+            )
+
+            clips = select_clips(
+                duration,
+                audio,
+                visual,
+                speech,
+                bool(transcript),
+                length=30,
+                min_gap=gap,
+                min_score=min_score
+            )
+
+            if not clips:
+                st.error(
+                    "No highlights met your minimum score. "
+                    "Try lowering the minimum highlight score."
+                )
+                st.stop()
+
+            output_directory = Path("generated_clips")
+            output_directory.mkdir(exist_ok=True)
+
+            for old_file in output_directory.glob("highlight_*.mp4"):
+                old_file.unlink(missing_ok=True)
+
+            made = []
+
+            for index, clip in enumerate(clips, 1):
+                output = output_directory / (
+                    f"highlight_{index:03d}.mp4"
+                )
+
+                progress.progress(
+                    70 + int(30 * index / len(clips)),
+                    text=(
+                        f"Exporting highlight "
+                        f"{index}/{len(clips)}..."
+                    )
+                )
+
+                cut(
+                    source,
+                    output,
+                    clip["start"],
+                    30,
+                    vertical
+                )
+
+                clip["path"] = output
+                clip["duration"] = 30.0
+                made.append(clip)
+
+            progress.empty()
+
+            if not made:
+                st.error("No clips were exported.")
+                st.stop()
+
+            st.success(
+                f"Created {len(made)} highlight clip(s)."
+            )
+            st.caption(
+                f"Video duration: {duration:.1f}s · "
+                f"Scene changes: {scene_count} · "
+                f"Whisper transcript segments: {len(transcript)}"
+            )
+
+            for index, clip in enumerate(made, 1):
+                with st.expander(
+                    f"Clip {index} · "
+                    f"{clip['start']:.1f}s–"
+                    f"{clip['start'] + 30:.1f}s · "
+                    f"Score {clip['score']:.0f}/100",
+                    expanded=index == 1
+                ):
+                    st.video(str(clip["path"]))
+                    st.write(
+                        "Selected using combined audio intensity, "
+                        "visual scene activity"
+                        + (
+                            " and speech signals."
+                            if transcript else "."
+                        )
+                    )
+                    st.download_button(
+                        "Download MP4",
+                        clip["path"].read_bytes(),
+                        file_name=clip["path"].name,
+                        mime="video/mp4",
+                        key=f"download_{index}"
+                    )
+
+            archive = output_directory / "all_highlights.zip"
+
+            with zipfile.ZipFile(
+                archive,
+                "w",
+                zipfile.ZIP_DEFLATED
+            ) as zip_file:
+                for clip in made:
+                    zip_file.write(
+                        clip["path"],
+                        arcname=clip["path"].name
+                    )
+
+            st.download_button(
+                "Download all clips (ZIP)",
+                archive.read_bytes(),
+                file_name="all_highlights.zip",
+                mime="application/zip"
+            )
+
+    except Exception as error:
+        st.error(f"Processing failed: {error}")
+        st.exception(error)
+
 
 st.divider()
-st.caption("Highlights are heuristic suggestions, not guaranteed best moments. Videos without audio are ranked mainly by scene changes. Uploaded files are processed locally when you run the app on your computer.")
+st.caption(
+    "Highlight ranking is heuristic, not a guarantee of virality. "
+    "Preview clips before publishing."
+)
